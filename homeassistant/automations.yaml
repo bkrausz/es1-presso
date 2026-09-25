@@ -1,0 +1,71 @@
+# Home Assistant side. Replace sensor.series_1_power with your smart plug's power entity.
+
+template:
+  - binary_sensor:
+      - name: "Series 1 awake"
+        unique_id: series_1_awake
+        device_class: power
+        # Asleep the machine idles at a few watts; awake the heater cycles at >1 kW every minute or two.
+        # "Awake" = any reading above 30 W in the last 3 minutes.
+        state: >
+          {{ states('sensor.series_1_power') | float(0) > 30 }}
+        delay_off:
+          minutes: 3
+
+automation:
+  - alias: "Espresso: wake machine (guarded)"
+    description: "One key press to wake the Series 1, only if it's actually asleep."
+    triggers:
+      # Whatever you like: a dashboard button, a time, 'good morning' routine, the bedroom presence sensor...
+      - trigger: state
+        entity_id: input_button.wake_espresso
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.series_1_awake
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.presso_brewing
+        state: "off"
+    actions:
+      - action: button.press
+        target:
+          entity_id: button.presso_press_key
+
+  - alias: "Espresso: refuse pull shot when machine asleep"
+    description: "Belt and braces: if someone hits Pull shot in HA while the machine is asleep, abort the logic so a wake-press isn't mistaken for a shot."
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.presso_brewing
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.series_1_awake
+        state: "off"
+    actions:
+      - action: button.press
+        target:
+          entity_id: button.presso_abort_shot_logic
+      - action: notify.mobile_app_your_phone
+        data:
+          message: "Series 1 was asleep — that press just woke it. Wait for it to heat, then pull again."
+
+  - alias: "Espresso: log shots"
+    triggers:
+      - trigger: state
+        entity_id: sensor.presso_last_shot_weight
+    conditions:
+      - "{{ trigger.to_state.state not in ['unknown', 'unavailable'] }}"
+    actions:
+      - action: logbook.log
+        data:
+          name: Espresso
+          message: >
+            {{ trigger.to_state.state }} g in
+            {{ states('sensor.presso_shot_time') }} s
+            (target {{ states('number.presso_target_weight') }} g,
+            offset now {{ states('number.presso_stop_offset') }} g)
+
+input_button:
+  wake_espresso:
+    name: Wake espresso machine
+    icon: mdi:coffee-maker

@@ -1,0 +1,641 @@
+# ============================================================
+#  Presso — gravimetric key presser for the Fellow Espresso Series 1
+#  AtomS3 Lite + MG996R + Acaia Lunar (2021, "new" BLE protocol)
+#
+#  What it does
+#   - Connects to the Lunar over BLE, keeps it alive with heartbeats,
+#     streams weight at ~10 Hz.
+#   - "Pull shot": tares, presses the espresso key, watches weight + flow,
+#     presses again just before target - offset is reached, then measures
+#     the settled weight 3 s later and learns the drip offset for next time.
+#   - Also notices shots you start by hand (weight starts climbing) and
+#     takes over the stop.
+#   - "Press key" / "Wake machine": one bare press for HA automations.
+#
+#  Things to fill in: substitutions below (scale MAC, wifi secrets).
+# ============================================================
+
+substitutions:
+  name: presso
+  friendly_name: "Presso"
+  scale_mac: "AA:BB:CC:DD:EE:FF"      # <-- your Lunar's BLE address (see README)
+  servo_pin: GPIO7                    # signal wire; any of G5/G6/G7/G8 on the AtomS3 Lite
+  # Acaia "new" protocol (Lunar 2021, Pyxis, Pearl S)
+  acaia_service: 49535343-fe7d-4ae5-8fa9-9fafd205e455
+  acaia_write:   49535343-8841-43f4-a8d4-ecbe34729bb3
+  acaia_notify:  49535343-1e4d-4bd9-ba61-23c647249616
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - servo.detach: key_servo
+      - light.turn_on: { id: status_led, red: 0, green: 0, blue: 0.3, brightness: 0.4 }
+
+esp32:
+  board: m5stack-atoms3
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+captive_portal:
+
+# OTA rides on the encrypted native API; no separate OTA password needed.
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Setup"
+
+# ------------------------------------------------------------
+#  BLE — Acaia Lunar
+# ------------------------------------------------------------
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+  # To find your scale's address the first time, uncomment this, flash, and
+  # watch the logs for a line with name='LUNAR-...'. Remove it afterwards.
+  # on_ble_advertise:
+  #   - then:
+  #       - lambda: |-
+  #           ESP_LOGI("ble", "%s  rssi=%d  name='%s'",
+  #                    x.address_str().c_str(), x.get_rssi(), x.get_name().c_str());
+
+ble_client:
+  - mac_address: ${scale_mac}
+    id: lunar
+    auto_connect: true
+    on_connect:
+      then:
+        - lambda: 'id(scale_connected) = true;'
+        - script.execute: scale_init
+    on_disconnect:
+      then:
+        - lambda: |-
+            id(scale_connected) = false;
+            id(scale_weight).publish_state(NAN);
+
+# ------------------------------------------------------------
+#  Servo
+# ------------------------------------------------------------
+output:
+  - platform: ledc
+    pin: ${servo_pin}
+    id: servo_pwm
+    frequency: 50 Hz
+
+servo:
+  - id: key_servo
+    output: servo_pwm
+    auto_detach_time: 0s
+    transition_length: 0s
+    min_level: 3%      # 0.6 ms pulse
+    max_level: 12%     # 2.4 ms pulse
+
+# ------------------------------------------------------------
+#  Status LED (AtomS3 Lite: WS2812 on GPIO35)
+# ------------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    pin: GPIO35
+    chipset: WS2812
+    num_leds: 1
+    rgb_order: GRB
+    name: "Status LED"
+    internal: true
+
+# ------------------------------------------------------------
+#  State
+# ------------------------------------------------------------
+globals:
+  - id: scale_connected
+    type: bool
+    initial_value: 'false'
+  - id: brewing
+    type: bool
+    initial_value: 'false'
+  - id: we_started
+    type: bool
+    initial_value: 'false'
+  - id: shot_start_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: shot_end_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: flow_gps
+    type: float
+    initial_value: '0'
+  - id: inst_flow
+    type: float
+    initial_value: '0'
+  - id: last_w
+    type: float
+    initial_value: '0'
+  - id: last_w_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: rising_samples
+    type: int
+    initial_value: '0'
+  - id: stall_since_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: awaiting_final
+    type: bool
+    initial_value: 'false'
+
+# ------------------------------------------------------------
+#  Tunables exposed to Home Assistant
+# ------------------------------------------------------------
+number:
+  - platform: template
+    name: "Target weight"
+    id: target_g
+    unit_of_measurement: g
+    min_value: 10
+    max_value: 120
+    step: 0.5
+    initial_value: 36
+    restore_value: true
+    optimistic: true
+    icon: mdi:target
+
+  - platform: template
+    name: "Stop offset"
+    id: offset_g
+    unit_of_measurement: g
+    min_value: 0
+    max_value: 6
+    step: 0.1
+    initial_value: 1.5
+    restore_value: true
+    optimistic: true
+    icon: mdi:water-minus
+    entity_category: config
+
+  - platform: template
+    name: "Stop latency"
+    id: latency_s
+    unit_of_measurement: s
+    min_value: 0
+    max_value: 2
+    step: 0.05
+    initial_value: 0.35
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    icon: mdi:timer-sand
+
+  - platform: template
+    name: "Servo rest position"
+    id: servo_rest
+    min_value: -1
+    max_value: 1
+    step: 0.01
+    initial_value: 0.0
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    icon: mdi:axis-z-rotate-counterclockwise
+    on_value:
+      then:
+        - script.execute: servo_jog
+
+  - platform: template
+    name: "Servo press position"
+    id: servo_press
+    min_value: -1
+    max_value: 1
+    step: 0.01
+    initial_value: -0.12
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    icon: mdi:axis-z-rotate-clockwise
+
+  - platform: template
+    name: "Press hold time"
+    id: press_ms
+    unit_of_measurement: ms
+    min_value: 80
+    max_value: 800
+    step: 10
+    initial_value: 250
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    icon: mdi:gesture-tap-hold
+
+  - platform: template
+    name: "Max shot time"
+    id: max_shot_s
+    unit_of_measurement: s
+    min_value: 20
+    max_value: 90
+    step: 1
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+    entity_category: config
+
+switch:
+  - platform: template
+    name: "Auto-stop manual shots"
+    id: auto_detect
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    icon: mdi:auto-fix
+  - platform: template
+    name: "Learn offset"
+    id: learn_offset
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    icon: mdi:school
+    entity_category: config
+
+button:
+  - platform: template
+    name: "Pull shot"
+    id: pull_shot_btn
+    icon: mdi:coffee
+    on_press:
+      - script.execute: pull_shot
+
+  - platform: template
+    name: "Press key"
+    icon: mdi:gesture-tap-button
+    on_press:
+      - script.execute: press_key
+
+  - platform: template
+    name: "Tare scale"
+    icon: mdi:scale-balance
+    on_press:
+      - script.execute: scale_tare
+
+  - platform: template
+    name: "Abort shot logic"
+    icon: mdi:cancel
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(brewing) = false;
+          id(awaiting_final) = false;
+          id(shot_state).publish_state("idle");
+
+# Physical button on the Atom: short = pull shot, long (>1 s) = bare key press
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO41
+      inverted: true
+      mode: { input: true, pullup: true }
+    id: atom_button
+    internal: true
+    on_multi_click:
+      - timing:
+          - ON for at most 0.8s
+          - OFF for at least 0.2s
+        then:
+          - script.execute: pull_shot
+      - timing:
+          - ON for at least 1s
+        then:
+          - script.execute: press_key
+
+  - platform: template
+    name: "Scale connected"
+    lambda: 'return id(scale_connected);'
+    device_class: connectivity
+
+  - platform: template
+    name: "Brewing"
+    lambda: 'return id(brewing);'
+    device_class: running
+
+# ------------------------------------------------------------
+#  Sensors
+# ------------------------------------------------------------
+sensor:
+  # Raw weight from the Lunar. on_raw_value feeds the shot logic at full
+  # rate; the throttle filter keeps HA traffic sane.
+  - platform: ble_client
+    ble_client_id: lunar
+    id: scale_weight
+    name: "Scale weight"
+    type: characteristic
+    service_uuid: ${acaia_service}
+    characteristic_uuid: ${acaia_notify}
+    notify: true
+    unit_of_measurement: g
+    accuracy_decimals: 1
+    icon: mdi:scale
+    lambda: |-
+      // Acaia "new" protocol weight event: 13- or 17-byte packet, event id 0x05.
+      // bytes 5,6 = weight (LE), byte 9 = decimal places, byte 10 bit 1 = negative.
+      if ((x.size() == 13 || x.size() == 17) && x[4] == 0x05) {
+        float w = (((x[6] & 0xff) << 8) | (x[5] & 0xff)) / powf(10.0f, x[9]);
+        if (x[10] & 0x02) w = -w;
+        return w;
+      }
+      return NAN;
+    filters:
+      - throttle: 250ms
+    on_raw_value:
+      then:
+        - lambda: |-
+            if (std::isnan(x)) return;
+            uint32_t now = millis();
+            if (id(last_w_ms) != 0) {
+              float dt = (now - id(last_w_ms)) / 1000.0f;
+              if (dt > 0.02f && dt < 2.0f) {
+                float inst = (x - id(last_w)) / dt;
+                id(inst_flow) = inst;
+                id(flow_gps) = 0.6f * id(flow_gps) + 0.4f * inst;
+              }
+            }
+            id(last_w) = x;
+            id(last_w_ms) = now;
+
+  - platform: template
+    name: "Flow rate"
+    id: flow_sensor
+    unit_of_measurement: g/s
+    accuracy_decimals: 2
+    lambda: 'return id(flow_gps);'
+    update_interval: 500ms
+    icon: mdi:water
+
+  - platform: template
+    name: "Shot time"
+    id: shot_time
+    unit_of_measurement: s
+    accuracy_decimals: 1
+    lambda: |-
+      if (id(brewing)) return (millis() - id(shot_start_ms)) / 1000.0f;
+      if (id(shot_end_ms) > id(shot_start_ms)) return (id(shot_end_ms) - id(shot_start_ms)) / 1000.0f;
+      return 0.0f;
+    update_interval: 500ms
+    icon: mdi:timer
+
+  - platform: template
+    name: "Last shot weight"
+    id: last_shot_g
+    unit_of_measurement: g
+    accuracy_decimals: 1
+    icon: mdi:coffee-outline
+
+text_sensor:
+  - platform: template
+    name: "Shot state"
+    id: shot_state
+    icon: mdi:state-machine
+
+# ------------------------------------------------------------
+#  Scripts
+# ------------------------------------------------------------
+script:
+  # Acaia handshake: identify, then ask for weight notifications.
+  - id: scale_init
+    mode: restart
+    then:
+      - delay: 1500ms
+      - ble_client.ble_write:
+          id: lunar
+          service_uuid: ${acaia_service}
+          characteristic_uuid: ${acaia_write}
+          value: [0xef, 0xdd, 0x0b, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30, 0x31, 0x32, 0x33, 0x34, 0x9a, 0x6d]
+      - delay: 200ms
+      - ble_client.ble_write:
+          id: lunar
+          service_uuid: ${acaia_service}
+          characteristic_uuid: ${acaia_write}
+          value: [0xef, 0xdd, 0x0c, 0x09, 0x00, 0x01, 0x01, 0x02, 0x02, 0x05, 0x03, 0x04, 0x15, 0x06]
+      - logger.log: "Lunar: identify + notification request sent"
+
+  - id: scale_heartbeat
+    then:
+      - ble_client.ble_write:
+          id: lunar
+          service_uuid: ${acaia_service}
+          characteristic_uuid: ${acaia_write}
+          value: [0xef, 0xdd, 0x00, 0x02, 0x00, 0x02, 0x00]
+
+  - id: scale_tare
+    then:
+      - ble_client.ble_write:
+          id: lunar
+          service_uuid: ${acaia_service}
+          characteristic_uuid: ${acaia_write}
+          value: [0xef, 0xdd, 0x04, 0x00, 0x00, 0x00]
+
+  - id: scale_timer_start
+    then:
+      - ble_client.ble_write:
+          id: lunar
+          service_uuid: ${acaia_service}
+          characteristic_uuid: ${acaia_write}
+          value: [0xef, 0xdd, 0x0d, 0x00, 0x01, 0x00, 0x01]   # reset
+      - delay: 100ms
+      - ble_client.ble_write:
+          id: lunar
+          service_uuid: ${acaia_service}
+          characteristic_uuid: ${acaia_write}
+          value: [0xef, 0xdd, 0x0d, 0x00, 0x00, 0x00, 0x00]   # start
+
+  - id: scale_timer_stop
+    then:
+      - ble_client.ble_write:
+          id: lunar
+          service_uuid: ${acaia_service}
+          characteristic_uuid: ${acaia_write}
+          value: [0xef, 0xdd, 0x0d, 0x00, 0x02, 0x00, 0x02]
+
+  # One tap of the espresso key. Servo is detached afterwards so it never
+  # sits stalled against the key or buzzes at rest.
+  - id: press_key
+    mode: single
+    then:
+      - servo.write:
+          id: key_servo
+          level: !lambda 'return id(servo_press).state;'
+      - delay: !lambda 'return (uint32_t) id(press_ms).state;'
+      - servo.write:
+          id: key_servo
+          level: !lambda 'return id(servo_rest).state;'
+      - delay: 400ms
+      - servo.detach: key_servo
+
+  # Move to rest so you can see where "rest" is while tuning.
+  - id: servo_jog
+    mode: restart
+    then:
+      - servo.write:
+          id: key_servo
+          level: !lambda 'return id(servo_rest).state;'
+      - delay: 600ms
+      - servo.detach: key_servo
+
+  - id: pull_shot
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(scale_connected);'
+          then:
+            - logger.log: { level: WARN, format: "Pull shot refused: scale not connected" }
+            - script.execute: blink_red
+      - if:
+          condition:
+            lambda: 'return id(scale_connected) && !id(brewing);'
+          then:
+            - script.execute: scale_tare
+            - delay: 600ms
+            - script.execute: scale_timer_start
+            - lambda: |-
+                id(brewing) = true;
+                id(we_started) = true;
+                id(shot_start_ms) = millis();
+                id(shot_end_ms) = 0;
+                id(stall_since_ms) = 0;
+                id(flow_gps) = 0;
+                id(awaiting_final) = false;
+                id(shot_state).publish_state("brewing (auto)");
+            - script.execute: press_key
+
+  - id: end_shot
+    mode: single
+    parameters:
+      press: bool
+      reason: string
+    then:
+      - lambda: |-
+          id(brewing) = false;
+          id(shot_end_ms) = millis();
+          id(shot_state).publish_state(reason);
+          ESP_LOGI("shot", "ending shot: %s (press=%d) at %.1fg", reason.c_str(), press, id(last_w));
+      - if:
+          condition:
+            lambda: 'return press;'
+          then:
+            - script.execute: press_key
+      - script.execute: scale_timer_stop
+      - lambda: 'id(awaiting_final) = true;'
+
+  - id: blink_red
+    then:
+      - light.turn_on: { id: status_led, red: 1, green: 0, blue: 0, brightness: 0.8 }
+      - delay: 150ms
+      - light.turn_on: { id: status_led, red: 0, green: 0, blue: 0.3, brightness: 0.4 }
+
+# ------------------------------------------------------------
+#  Periodic logic
+# ------------------------------------------------------------
+interval:
+  # Acaia drops the connection without a heartbeat every few seconds.
+  - interval: 2500ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(scale_connected);'
+          then:
+            - script.execute: scale_heartbeat
+
+  # Shot state machine, 10 Hz.
+  - interval: 100ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          const float w    = id(last_w);
+          const float flow = id(flow_gps);
+          const float goal = id(target_g).state - id(offset_g).state;
+
+          // --- detect a shot started by hand -------------------------
+          if (!id(brewing) && !id(awaiting_final) && id(auto_detect).state && id(scale_connected)) {
+            // A shot climbs at 0.3-8 g/s. A cup landing on the scale is a 50+ g/s
+            // step (and the Lunar's auto-tare then snaps it back to 0), so anything
+            // outside the band resets the counter.
+            const float f = id(inst_flow);
+            if (w > 0.8f && f > 0.3f && f < 8.0f && w < 40.0f) id(rising_samples)++;
+            else id(rising_samples) = 0;
+            if (id(rising_samples) >= 6) {          // ~0.6 s of shot-like rise
+              id(brewing) = true;
+              id(we_started) = false;
+              id(shot_start_ms) = now - 1500;       // rough: first drops take a while
+              id(shot_end_ms) = 0;
+              id(stall_since_ms) = 0;
+              id(rising_samples) = 0;
+              id(shot_state).publish_state("brewing (manual)");
+              ESP_LOGI("shot", "manual shot detected at %.1fg", w);
+            }
+          }
+
+          if (id(brewing)) {
+            const float t = (now - id(shot_start_ms)) / 1000.0f;
+            const float predicted = w + flow * id(latency_s).state;
+
+            // machine stopped by itself (volumetric target, user pressed the key...)
+            if (t > 8.0f && flow < 0.15f) {
+              if (id(stall_since_ms) == 0) id(stall_since_ms) = now;
+              if (now - id(stall_since_ms) > 2500) {
+                id(end_shot).execute(false, "ended by machine");
+                return;
+              }
+            } else {
+              id(stall_since_ms) = 0;
+            }
+
+            // weight reached -> press the key, but only while it's still flowing
+            if (t > 3.0f && predicted >= goal && flow > 0.2f) {
+              id(end_shot).execute(true, "stopped at weight");
+              return;
+            }
+
+            // safety net
+            if (t > id(max_shot_s).state) {
+              id(end_shot).execute(flow > 0.2f, "max time");
+              return;
+            }
+          }
+
+          // --- settled weight, 3 s after the stop --------------------
+          if (id(awaiting_final) && now - id(shot_end_ms) > 3000) {
+            id(awaiting_final) = false;
+            id(last_shot_g).publish_state(w);
+            const float err = w - id(target_g).state;
+            ESP_LOGI("shot", "final weight %.1fg (target %.1f, offset %.1f, error %+.1f)",
+                     w, id(target_g).state, id(offset_g).state, err);
+            if (id(learn_offset).state && fabsf(err) <= 5.0f) {
+              float o = id(offset_g).state + err;
+              o = fmaxf(0.0f, fminf(6.0f, o));
+              id(offset_g).publish_state(o);
+              ESP_LOGI("shot", "offset updated to %.1fg", o);
+            }
+            id(shot_state).publish_state("idle");
+          }
+
+  # LED: blue idle, green brewing, dim red if the scale is missing
+  - interval: 500ms
+    then:
+      - lambda: |-
+          auto call = id(status_led).turn_on();
+          if (id(brewing))              call.set_rgb(0, 1, 0);
+          else if (!id(scale_connected)) call.set_rgb(0.5, 0, 0);
+          else                          call.set_rgb(0, 0, 0.3);
+          call.set_brightness(id(brewing) ? 0.8 : 0.4);
+          call.set_transition_length(0);
+          call.perform();
