@@ -53,7 +53,7 @@ Prices are rough US retail, Sept 2026.
 | 3-pin male header + servo extension cable | Header solders to the proto; extension reaches the mount | 3 |
 | 22 AWG silicone wire | For the 5 V / GND run to the servo header | — |
 | Screws | 4× M3×10 + nuts (servo ears), 1× M4×16 + nut (lip clamp), 1× M3×20 + nut (hard stop), M2 horn screws from the servo bag | 3 |
-| ~60 g PETG | Two printed parts | 2 |
+| ~60 g PLA (or PETG) | Two printed parts | 2 |
 | Scrap of TPU or a silicone bumper | Pad on the arm tip; felt inside the lip clamp | — |
 
 Optional:
@@ -67,14 +67,15 @@ Optional:
 
 ### 1. Print
 
-`hardware/presso_base.stl` and `hardware/presso_arm.stl`, PETG.
+`hardware/presso_base.stl` and `hardware/presso_arm.stl`. PLA works fine; the working unit is
+PLA. PETG is an option if you want extra margin against heat from the warming mat under the base.
 
 - Base: as exported, flat. 4 walls, 30 % infill, no supports.
 - Arm: as exported (lying flat, horn pocket up). 5 walls or 100 % infill — it's a 60 mm cantilever taking 300 g.
 
 Everything is parametric in `hardware/presso_mount.scad` (OpenSCAD). The measurements at the top
-are from one Series 1; if yours differs, change the numbers and re-export. Do a PLA fit check of
-the base first — `lip_slot_clear` and `key_rear_clear` are the two most likely to need a nudge.
+are from one Series 1; if yours differs, change the numbers and re-export. `lip_slot_clear` and
+`key_rear_clear` are the two most likely to need a nudge.
 
 **How the mount sits.** The base rests on the warming mat directly behind the keys. Its outboard
 end straddles the raised lip on the side of the machine; an M4 bolt through the outer wall pinches
