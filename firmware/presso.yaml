@@ -151,6 +151,9 @@ globals:
   - id: rising_samples
     type: int
     initial_value: '0'
+  - id: flow_started
+    type: bool
+    initial_value: 'false'
   - id: stall_since_ms
     type: uint32_t
     initial_value: '0'
@@ -512,6 +515,7 @@ script:
                 id(shot_start_ms) = millis();
                 id(shot_end_ms) = 0;
                 id(stall_since_ms) = 0;
+                id(flow_started) = false;
                 id(flow_gps) = 0;
                 id(awaiting_final) = false;
                 id(shot_state).publish_state("brewing (auto)");
@@ -578,6 +582,7 @@ interval:
               id(shot_start_ms) = now - 1500;       // rough: first drops take a while
               id(shot_end_ms) = 0;
               id(stall_since_ms) = 0;
+              id(flow_started) = true;
               id(rising_samples) = 0;
               id(shot_state).publish_state("brewing (manual)");
               ESP_LOGI("shot", "manual shot detected at %.1fg", w);
@@ -588,8 +593,15 @@ interval:
             const float t = (now - id(shot_start_ms)) / 1000.0f;
             const float predicted = w + flow * id(latency_s).state;
 
+            // First drips. Pre-infusion can hold the cup dry for 10+ s, so nothing
+            // below counts "no flow" as a stopped machine until coffee has arrived.
+            if (!id(flow_started) && w > 1.0f && flow > 0.3f) {
+              id(flow_started) = true;
+              ESP_LOGI("shot", "first flow at %.1fs", t);
+            }
+
             // machine stopped by itself (volumetric target, user pressed the key...)
-            if (t > 8.0f && flow < 0.15f) {
+            if (id(flow_started) && flow < 0.15f) {
               if (id(stall_since_ms) == 0) id(stall_since_ms) = now;
               if (now - id(stall_since_ms) > 2500) {
                 id(end_shot).execute(false, "ended by machine");

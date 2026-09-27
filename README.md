@@ -27,7 +27,8 @@ to a lip on the case and lifts off in a second.
 3. It watches weight and flow rate. When `weight + flow × latency ≥ target − offset`, it taps
    the key again. It only ever presses while coffee is still flowing: if the machine ends the shot
    on its own (volumetric target, or you pressed the key), Presso stands down rather than pressing
-   into a stopped machine — which would start a *new* shot.
+   into a stopped machine — which would start a *new* shot. "Stopped" only counts once coffee
+   has started arriving, so long pre-infusion with a dry cup is fine.
 4. Three seconds after the stop it reads the settled weight and nudges the offset by the error,
    so the second or third shot lands on target.
 
