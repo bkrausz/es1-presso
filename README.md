@@ -114,7 +114,11 @@ Notes from the build:
   flash, turn the scale on, and watch the logs for `name='LUNAR-…'`. (iOS hides BLE addresses,
   so nRF Connect on an iPhone can't tell you.) Put it in `scale_mac`, remove the block, reflash.
 - First flash is over USB: hold the Atom's side reset button ~2 s until the LED goes green, then
-  install from the ESPHome dashboard. Everything after that is OTA over the encrypted API.
+  install from the ESPHome dashboard. Everything after that is OTA, encrypted with the API key
+  (`ota: encryption:`, ESPHome 2026.9 or newer).
+- Upgrading a Presso that's running firmware built before ESPHome 2026.9? The uploader refuses
+  to send an encrypted-OTA build to a device that can't decrypt it. Comment out the
+  `encryption:` line under `ota:`, install once, then restore it and install again.
 - **Servo unplugged for the first flash.** Plug it in once ESPHome is running; it's safe to
   hot-plug after that because the firmware detaches the servo at boot and after every press.
 

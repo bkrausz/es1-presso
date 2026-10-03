@@ -49,9 +49,11 @@ api:
 
 captive_portal:
 
-# OTA rides on the encrypted native API; no separate OTA password needed.
+# OTA uploads are encrypted and authenticated with the same key as the API
+# (needs ESPHome 2026.9+). No separate OTA password.
 ota:
   - platform: esphome
+    encryption:
 
 wifi:
   ssid: !secret wifi_ssid
@@ -113,7 +115,7 @@ light:
     pin: GPIO35
     chipset: WS2812
     num_leds: 1
-    rgb_order: GRB
+    channel_colors: GRB
     name: "Status LED"
     internal: true
 
